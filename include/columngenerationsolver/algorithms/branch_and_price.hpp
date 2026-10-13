@@ -1,6 +1,7 @@
 #pragma once
 
 #include "columngenerationsolver/algorithms/column_generation.hpp"
+#include <iomanip>
 
 namespace columngenerationsolver
 {

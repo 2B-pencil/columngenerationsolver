@@ -3,6 +3,7 @@
 #include "columngenerationsolver/commons.hpp"
 
 #include <unordered_set>
+#include <iomanip>
 
 namespace columngenerationsolver
 {
