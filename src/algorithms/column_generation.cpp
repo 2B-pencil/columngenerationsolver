@@ -44,6 +44,17 @@ using ColumnPool = std::unordered_set<
     const ColumnHasher&>;
 
 /**
+ * The 'overcost_goal' of 'PricingSolver::solve_pricing' meaning that there
+ * is no goal.
+ */
+Value no_overcost_goal(const Model& model)
+{
+    return (model.objective_sense == optimizationtools::ObjectiveDirection::Minimize)?
+        std::numeric_limits<Value>::infinity():
+        -std::numeric_limits<Value>::infinity();
+}
+
+/**
  * Whether 'value' (sense-aware: a proven bound, or a hypothetical "best
  * case" relaxation value) is already no better than
  * 'parameters.objective_cutoff' -- i.e. whether a node stuck at 'value'
@@ -468,7 +479,8 @@ void run_rounding_heuristic(RoundingHeuristicInput& input)
                             input.attempt_input.parameters.tabu,
                             input.duals_out,
                             input.cut_duals,
-                            PricingSolver::PricingType::Primal);
+                            PricingSolver::PricingType::Primal,
+                            no_overcost_goal(input.attempt_input.model));
                     std::vector<std::shared_ptr<const Column>> new_columns;
                     for (const auto& column: pricing_output.columns) {
                         if (column->elements.empty())
@@ -850,7 +862,13 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
             lower_bounds,
             upper_bounds);
 
-    // Add initial columns.
+    // Add initial columns, all at once: adding them one by one makes the LP
+    // solver extend its matrix for each of them.
+    lower_bounds.clear();
+    upper_bounds.clear();
+    objective_coefficients.clear();
+    row_ids.clear();
+    row_coefficients.clear();
     for (const std::shared_ptr<const Column>& column: input.initial_columns) {
         input.model.check_generated_column(column);
 
@@ -863,8 +881,8 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
         if (input.parameters.tabu.find(column) != input.parameters.tabu.end())
             continue;
 
-        std::vector<RowIdx> row_ids;
-        std::vector<Value> row_coefficients;
+        std::vector<RowIdx> column_row_ids;
+        std::vector<Value> column_row_coefficients;
         bool ok = true;
         for (const LinearTerm& element: column->elements) {
             // The column might not be feasible.
@@ -882,22 +900,28 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
                 ok = false;
                 break;
             }
-            row_ids.push_back(input.new_row_indices[element.row]);
-            row_coefficients.push_back(element.coefficient);
+            column_row_ids.push_back(input.new_row_indices[element.row]);
+            column_row_coefficients.push_back(element.coefficient);
         }
         if (!ok)
             continue;
-        append_cut_coefficients(*column, row_ids, row_coefficients);
+        append_cut_coefficients(*column, column_row_ids, column_row_coefficients);
         solver_columns.push_back(column);
         solver_generated_columns.insert(column);
-        solver->add_column(
-                row_ids,
-                row_coefficients,
-                input.solve_feasibility? 0: column->objective_coefficient,
-                0,
-                std::numeric_limits<Value>::infinity());
+        lower_bounds.push_back(0);
+        upper_bounds.push_back(std::numeric_limits<Value>::infinity());
+        objective_coefficients.push_back(
+                input.solve_feasibility? 0: column->objective_coefficient);
+        row_ids.push_back(column_row_ids);
+        row_coefficients.push_back(column_row_coefficients);
         input.output.number_of_columns_in_linear_subproblem++;
     }
+    solver->add_columns(
+            row_ids,
+            row_coefficients,
+            objective_coefficients,
+            lower_bounds,
+            upper_bounds);
 
     auto end_lp_construction = std::chrono::high_resolution_clock::now();
     input.output.time_lp_construction += std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -1337,7 +1361,8 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
                             input.parameters.tabu,
                             duals_sep,
                             cut_duals,
-                            PricingSolver::PricingType::Primal);
+                            PricingSolver::PricingType::Primal,
+                            no_overcost_goal(input.model));
                     all_columns = pricing_output.columns;
                     overcost = pricing_output.overcost;
                     pricing_lagrangian_column_values = std::move(pricing_output.lagrangian_column_values);
@@ -1354,7 +1379,8 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
                                 input.parameters.tabu,
                                 duals_sep,
                                 cut_duals,
-                                PricingSolver::PricingType::Primal);
+                                PricingSolver::PricingType::Primal,
+                                no_overcost_goal(input.model));
                         std::vector<std::shared_ptr<const Column>> all_columns_tmp_0
                             = pricing_output.columns;
                         if (i == 0) {
@@ -1706,6 +1732,18 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
             && input.number_of_dual_pricing_calls < 2) {
         ++input.number_of_dual_pricing_calls;
 
+        // The 'overcost' from which 'apply_overcost' below cuts the node:
+        // in the feasibility phase, 'solver->objective() + overcost'
+        // proves infeasibility once beyond the tolerance; in the
+        // optimality phase, 'relaxation_solution_value + overcost' reaches
+        // the cutoff.
+        bool minimize = (input.model.objective_sense == optimizationtools::ObjectiveDirection::Minimize);
+        Value dual_pricing_overcost_goal = (input.solve_feasibility)?
+            ((minimize)? FFOT_TOL: -FFOT_TOL) - solver->objective():
+            input.parameters.objective_cutoff
+                + ((minimize)? -FFOT_TOL: FFOT_TOL)
+                - input.output.relaxation_solution_value;
+
         // A single direct call, deliberately bypassing
         // 'parameters.internal_diving' (see its use further up, gating
         // 'PricingType::Primal' calls only): diving's repeated greedy
@@ -1719,7 +1757,8 @@ ColumnGenerationAttemptResult run_column_generation_attempt(
                 input.parameters.tabu,
                 duals_out,
                 cut_duals,
-                PricingSolver::PricingType::Dual);
+                PricingSolver::PricingType::Dual,
+                dual_pricing_overcost_goal);
         auto end_pricing = std::chrono::high_resolution_clock::now();
         double dual_pricing_time = std::chrono::duration_cast<std::chrono::duration<double>>(
                 end_pricing - start_pricing).count();
